@@ -1,5 +1,0 @@
-# Local development only. Copy to .dev.vars and replace the placeholders.
-# Never commit actual values. Production values already exist in Cloudflare secrets.
-DISCORD_APPLICATION_ID="your_discord_application_id"
-DISCORD_PUBLIC_KEY="your_discord_public_key"
-DISCORD_TOKEN="your_discord_bot_token"
