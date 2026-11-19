@@ -14,9 +14,10 @@ const liarBtn = (s,label,act,style=2,arg) => b(label,liarId(s,act,arg),style);
 const liarMention = id => "<@"+id+">";
 const liarLimit = 30*60*1000;
 const LIAR_TALK_MS = 60_000;
+const LIAR_LOBBY_MS = 60_000;
 const LIAR_TICK_MS = 5_000;
 function liarCountdown(s,now=Date.now()){
-  const left=Math.max(0,Math.min(60,Math.ceil((s.talkUntil-now)/1000)));
+  const left=Math.max(0,Math.min(60,Math.ceil(((s.phase==="lobby"?s.lobbyUntil:s.talkUntil)-now)/1000)));
   const filled=Math.ceil(left/5);
   return "**⏱️ 남은 시간 "+String(Math.floor(left/60)).padStart(2,"0")+":"+String(left%60).padStart(2,"0")+"**\n"+ "🟩".repeat(filled)+"⬛".repeat(12-filled);
 }
@@ -25,6 +26,26 @@ function liarNextTick(deadline,now=Date.now()){
   return Math.min(deadline,start+(Math.floor(Math.max(0,now-start)/LIAR_TICK_MS)+1)*LIAR_TICK_MS);
 }
 function liarDeadline(s,now=Date.now()){return s.phase==="talk"&&Number.isFinite(s.talkUntil)&&now>=s.talkUntil;}
+function liarLobbyDeadline(s,now=Date.now()){return s.phase==="lobby"&&Number.isFinite(s.lobbyUntil)&&now>=s.lobbyUntil;}
+function liarOpenLobby(s){
+  s.phase="lobby";s.lobbyUntil=Date.now()+LIAR_LOBBY_MS;s.lobbyAuto=null;s.closeReason=null;
+}
+function liarExpireLobby(s){
+  if(!liarLobbyDeadline(s))return false;
+  s.lobbyAuto=s.lobbyUntil;
+  if(s.players.length>=3)liarInitRound(s);
+  else{s.phase="closed";s.closeReason="참가 인원이 3명 미만이어서 모집이 종료되었습니다.";}
+  return true;
+}
+async function liarArm(env,s,kind,token){
+  const deadline=kind==="lobby"?s.lobbyUntil:s.talkUntil;
+  const name=s.id+":"+s.round+(kind==="lobby"?":lobby":"");
+  await env.LIAR_TIMER.getByName(name).arm({id:s.id,round:s.round,deadline,kind,token});
+}
+async function liarTryArm(env,s,kind,token){
+  try{await liarArm(env,s,kind,token);}
+  catch{console.warn("liar_timer_schedule_failed",kind);}
+}
 const liarNorm = value => String(value??"").normalize("NFKC").replace(/\s+/g,"").toLowerCase();
 function liarInitRound(s) {
   const old=s.word;
@@ -37,8 +58,8 @@ function liarBoard(s) {
   let t="**🎭 라이어 게임** · "+s.round+"라운드\n";
   const p=s.players.map(x=>(x.id===s.host?"👑 ":"• ")+liarMention(x.id)).join("\n");
   const close=liarBtn(s,"종료","close",4),refresh=liarBtn(s,"새로고침","refresh");
-  if(s.phase==="closed")return [t+"게임이 종료되었습니다.",[]];
-  if(s.phase==="lobby")return [t+"**참가 대기 ("+s.players.length+"/8명)**\n"+p+"\n\n3명 이상 참가하면 방장이 시작할 수 있습니다.",rows([liarBtn(s,"참가","join",3),liarBtn(s,"나가기","leave"),liarBtn(s,"시작","start",1),close,refresh])];
+  if(s.phase==="closed")return [t+(s.closeReason||"게임이 종료되었습니다."),[]];
+  if(s.phase==="lobby")return [t+"**참가 대기 ("+s.players.length+"/8명)**\n"+p+(s.lobbyUntil?"\n\n"+liarCountdown(s)+"\n60초 후 3명 이상이면 자동 시작합니다. 인원이 부족하면 모집이 종료됩니다.":"\n\n3명 이상 참가하면 방장이 시작할 수 있습니다.")+"\n방장은 먼저 시작할 수 있습니다.",rows([liarBtn(s,"참가","join",3),liarBtn(s,"나가기","leave"),liarBtn(s,"시작","start",1),close,refresh])];
   if(s.phase==="talk")return [t+"주제: **"+s.category+"**\n\n"+p+"\n\n각자 [내 제시어]를 눌러 확인한 뒤 음성 채널에서 한 번씩 설명하세요. 설명 시간은 60초입니다."+(s.talkUntil?"\n\n"+liarCountdown(s)+"\n투표 시작 예정: <t:"+Math.ceil(s.talkUntil/1000)+":T>":"") ,rows([liarBtn(s,"내 제시어","role",1),liarBtn(s,"조기 투표","voting",3),close,refresh])];
   if(s.phase==="vote"){
     const buttons=s.players.map((x,j)=>liarBtn(s,(j+1)+". "+x.name.slice(0,55),"vote",1,x.id));
@@ -70,7 +91,7 @@ function liarTransition(s,act,u,arg){
     if(!host)return "방장만 시작할 수 있습니다.";
     if(s.phase!==(act==="start"?"lobby":"ended"))return "현재 시작할 수 없습니다.";
     if(s.players.length<3)return "최소 3명이 필요합니다.";
-    if(act==="again"){s.round++;s.phase="lobby";s.talkUntil=null;s.votes={};s.liar=null;s.suspect=null;s.winner=null;return;}
+    if(act==="again"){s.round++;liarOpenLobby(s);s.talkUntil=null;s.votes={};s.liar=null;s.suspect=null;s.winner=null;return;}
     liarInitRound(s);return;
   }
   if(act==="voting"){
@@ -99,7 +120,9 @@ async function liarAction(i,env){
   if(prefix!=="l"||!/^\d{15,22}$/.test(u.id)||!ch)return err("잘못된 게임 요청입니다.");
   if(act==="new"){
     const s={id:crypto.randomUUID(),channel:ch,game:"liar",host:u.id,players:[u],round:1,phase:"lobby",votes:{},expires:Date.now()+liarLimit,message:i.message?.id||null};
+    liarOpenLobby(s);
     await env.DB.prepare("INSERT INTO card_rooms (id,channel_id,game,state_json,version,updated_at) VALUES (?,?,?,?,0,?)").bind(s.id,ch,"liar",JSON.stringify(s),Date.now()).run();
+    await liarTryArm(env,s,"lobby",i.token);
     return edit(...liarBoard(s));
   }
   if(!id||!/^\d+$/.test(round))return err("잘못된 게임 버튼입니다.");
@@ -109,6 +132,13 @@ async function liarAction(i,env){
     const s=JSON.parse(row.state_json);
     if(s.message&&i.message?.id&&s.message!==i.message.id)return err("원래 게임 메시지를 사용하세요.");
     if(s.expires<Date.now())return err("게임방이 만료되었습니다. /게임시작으로 새 방을 여세요.");
+    if(liarLobbyDeadline(s)){
+      liarExpireLobby(s);
+      const q=await env.DB.prepare("UPDATE card_rooms SET state_json=?,version=version+1,updated_at=? WHERE id=? AND version=? AND game='liar'").bind(JSON.stringify(s),Date.now(),id,row.version).run();
+      if(q.meta?.changes!==1)continue;
+      if(s.phase==="talk")await liarTryArm(env,s,"talk",i.token);
+      return edit(...liarBoard(s));
+    }
     if(liarDeadline(s)){
       s.phase="vote";
       const q=await env.DB.prepare("UPDATE card_rooms SET state_json=?,version=version+1,updated_at=? WHERE id=? AND version=? AND game='liar'").bind(JSON.stringify(s),Date.now(),id,row.version).run();
@@ -132,10 +162,8 @@ async function liarAction(i,env){
     s.expires=Date.now()+liarLimit;
     const q=await env.DB.prepare("UPDATE card_rooms SET state_json=?,version=version+1,updated_at=? WHERE id=? AND version=? AND game='liar'").bind(JSON.stringify(s),Date.now(),id,row.version).run();
     if(q.meta?.changes===1){
-      if(act==="start"){
-        try{await env.LIAR_TIMER.getByName(s.id+":"+s.round).arm({id:s.id,round:s.round,deadline:s.talkUntil,token:i.token});}
-        catch(e){console.warn("liar_timer_schedule_failed");}
-      }
+      if(act==="start")await liarTryArm(env,s,"talk",i.token);
+      if(act==="again")await liarTryArm(env,s,"lobby",i.token);
       return edit(...liarBoard(s));
     }
   }
@@ -143,7 +171,7 @@ async function liarAction(i,env){
 }
 
  
-// One durable alarm per round. D1 remains the source of truth.
+// Separate durable alarm per lobby and discussion. D1 remains the source of truth.
 // The Discord interaction token is retained only until delivery or expiry.
 export class LiarTimer extends DurableObject {
   async arm(job){
@@ -151,9 +179,44 @@ export class LiarTimer extends DurableObject {
     await this.ctx.storage.put("job",job);
     await this.ctx.storage.setAlarm(liarNextTick(job.deadline));
   }
+  async lobbyAlarm(job){
+    const clear=()=>this.ctx.storage.delete("job"),db=this.env.DB;
+    if(Date.now()>job.deadline+12*60_000){await clear();return;}
+    let current=null;
+    for(let n=0;n<4;n++){
+      const row=await db.prepare("SELECT state_json,version FROM card_rooms WHERE id=? AND game='liar'").bind(job.id).first();
+      if(!row){await clear();return;}
+      const s=JSON.parse(row.state_json);
+      if(s.round!==job.round||s.lobbyUntil!==job.deadline||s.expires<Date.now()){await clear();return;}
+      if(s.phase==="lobby"&&liarExpireLobby(s)){
+        const q=await db.prepare("UPDATE card_rooms SET state_json=?,version=version+1,updated_at=? WHERE id=? AND version=? AND game='liar'").bind(JSON.stringify(s),Date.now(),job.id,row.version).run();
+        if(q.meta?.changes!==1)continue;
+      }
+      current=s;break;
+    }
+    if(!current)throw Error("lobby timer state contention");
+    const latest=await db.prepare("SELECT state_json FROM card_rooms WHERE id=? AND game='liar'").bind(job.id).first();
+    if(!latest){await clear();return;}
+    const s=JSON.parse(latest.state_json);
+    if(s.round!==job.round||s.lobbyUntil!==job.deadline){await clear();return;}
+    const ticking=s.phase==="lobby";
+    const auto=s.lobbyAuto===job.deadline;
+    if(!ticking&&(!auto||!["talk","closed"].includes(s.phase))){await clear();return;}
+    if(ticking)await this.ctx.storage.setAlarm(liarNextTick(job.deadline));
+    if(!ticking&&s.phase==="talk")await liarArm(this.env,s,"talk",job.token);
+    const [content,buttons]=liarBoard(s);
+    const url="https://discord.com/api/v10/webhooks/"+encodeURIComponent(this.env.DISCORD_APPLICATION_ID)+"/"+encodeURIComponent(job.token)+"/messages/@original";
+    let response;
+    try{response=await fetch(url,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(payloadText(content,buttons))});}
+    catch{if(ticking)return;throw Error("lobby board delivery failed");}
+    if(response.status===429||response.status>=500){if(ticking)return;throw Error("lobby board delivery retry");}
+    if(!response.ok)console.warn("liar_lobby_board_status",response.status);
+    if(!ticking)await clear();
+  }
   async alarm(){
     const job=await this.ctx.storage.get("job");
     if(!job)return;
+    if(job.kind==="lobby")return this.lobbyAlarm(job);
     const clear=()=>this.ctx.storage.delete("job");
     if(Date.now()>job.deadline+12*60_000){await clear();return;}
     const db=this.env.DB;
