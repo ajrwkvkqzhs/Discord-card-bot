@@ -19,7 +19,8 @@ const LIAR_TICK_MS = 5_000;
 function liarCountdown(s,now=Date.now()){
   const left=Math.max(0,Math.min(60,Math.ceil(((s.phase==="lobby"?s.lobbyUntil:s.talkUntil)-now)/1000)));
   const filled=Math.ceil(left/5);
-  return "**⏱️ 남은 시간 "+String(Math.floor(left/60)).padStart(2,"0")+":"+String(left%60).padStart(2,"0")+"**\n"+ "🟩".repeat(filled)+"⬛".repeat(12-filled);
+  const deadline=s.phase==="lobby"?s.lobbyUntil:s.talkUntil;
+  return "**⏱️ 종료 <t:"+Math.ceil(deadline/1000)+":R>**\n"+String(Math.floor(left/60)).padStart(2,"0")+":"+String(left%60).padStart(2,"0")+" · "+"🟩".repeat(filled)+"⬛".repeat(12-filled);
 }
 function liarNextTick(deadline,now=Date.now()){
   const start=deadline-LIAR_TALK_MS;
@@ -173,6 +174,30 @@ async function liarAction(i,env){
  
 // Separate durable alarm per lobby and discussion. D1 remains the source of truth.
 // The Discord interaction token is retained only until delivery or expiry.
+
+async function liarPublish(env,job,state,content,buttons,request=fetch){
+  const api="https://discord.com/api/v10",body=JSON.stringify(payloadText(content,buttons));
+  const paths=[];
+  if(job.token&&env.DISCORD_APPLICATION_ID){
+    const base=api+"/webhooks/"+encodeURIComponent(env.DISCORD_APPLICATION_ID)+"/"+encodeURIComponent(job.token)+"/messages/";
+    paths.push({via:"original",url:base+"@original",headers:{}});
+    if(state.message)paths.push({via:"webhook_message",url:base+encodeURIComponent(state.message),headers:{}});
+  }
+  if(env.DISCORD_TOKEN&&state.channel&&state.message)paths.push({via:"bot",url:api+"/channels/"+encodeURIComponent(state.channel)+"/messages/"+encodeURIComponent(state.message),headers:{Authorization:"Bot "+env.DISCORD_TOKEN}});
+  let last={ok:false,status:503};
+  for(const p of paths){
+    try{
+      const r=await request(p.url,{method:"PATCH",headers:{"Content-Type":"application/json",...p.headers},body});
+      last=r;
+      if(r.ok)return r;
+      const detail=await r.clone().json().catch(()=>({}));
+      console.warn("liar_publish_failed",p.via,r.status,Number(detail.code)||0);
+      if(r.status===429)return r;
+    }catch{console.warn("liar_publish_network",p.via);}
+  }
+  return last;
+}
+
 export class LiarTimer extends DurableObject {
   async arm(job){
     if(!job?.token||!Number.isFinite(job.deadline))throw Error("invalid timer");
@@ -205,9 +230,8 @@ export class LiarTimer extends DurableObject {
     if(ticking)await this.ctx.storage.setAlarm(liarNextTick(job.deadline));
     if(!ticking&&s.phase==="talk")await liarArm(this.env,s,"talk",job.token);
     const [content,buttons]=liarBoard(s);
-    const url="https://discord.com/api/v10/webhooks/"+encodeURIComponent(this.env.DISCORD_APPLICATION_ID)+"/"+encodeURIComponent(job.token)+"/messages/@original";
     let response;
-    try{response=await fetch(url,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(payloadText(content,buttons))});}
+    try{response=await liarPublish(this.env,job,s,content,buttons);}
     catch{if(ticking)return;throw Error("lobby board delivery failed");}
     if(response.status===429||response.status>=500){if(ticking)return;throw Error("lobby board delivery retry");}
     if(!response.ok)console.warn("liar_lobby_board_status",response.status);
@@ -244,9 +268,8 @@ export class LiarTimer extends DurableObject {
     // Schedule the next tick before the network call, including the final deadline.
     if(ticking)await this.ctx.storage.setAlarm(liarNextTick(job.deadline));
     const [content,buttons]=liarBoard(state);
-    const url="https://discord.com/api/v10/webhooks/"+encodeURIComponent(this.env.DISCORD_APPLICATION_ID)+"/"+encodeURIComponent(job.token)+"/messages/@original";
     let response;
-    try{response=await fetch(url,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(payloadText(content,buttons))});}
+    try{response=await liarPublish(this.env,job,state,content,buttons);}
     catch{if(ticking)return;throw Error("timer board delivery failed");}
     if(response.status===429||response.status>=500){
       if(ticking)return; // Next scheduled tick retries without a burst of edits.
