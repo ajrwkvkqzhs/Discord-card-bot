@@ -14,6 +14,16 @@ const liarBtn = (s,label,act,style=2,arg) => b(label,liarId(s,act,arg),style);
 const liarMention = id => "<@"+id+">";
 const liarLimit = 30*60*1000;
 const LIAR_TALK_MS = 60_000;
+const LIAR_TICK_MS = 5_000;
+function liarCountdown(s,now=Date.now()){
+  const left=Math.max(0,Math.min(60,Math.ceil((s.talkUntil-now)/1000)));
+  const filled=Math.ceil(left/5);
+  return "**⏱️ 남은 시간 "+String(Math.floor(left/60)).padStart(2,"0")+":"+String(left%60).padStart(2,"0")+"**\n"+ "🟩".repeat(filled)+"⬛".repeat(12-filled);
+}
+function liarNextTick(deadline,now=Date.now()){
+  const start=deadline-LIAR_TALK_MS;
+  return Math.min(deadline,start+(Math.floor(Math.max(0,now-start)/LIAR_TICK_MS)+1)*LIAR_TICK_MS);
+}
 function liarDeadline(s,now=Date.now()){return s.phase==="talk"&&Number.isFinite(s.talkUntil)&&now>=s.talkUntil;}
 const liarNorm = value => String(value??"").normalize("NFKC").replace(/\s+/g,"").toLowerCase();
 function liarInitRound(s) {
@@ -29,7 +39,7 @@ function liarBoard(s) {
   const close=liarBtn(s,"종료","close",4),refresh=liarBtn(s,"새로고침","refresh");
   if(s.phase==="closed")return [t+"게임이 종료되었습니다.",[]];
   if(s.phase==="lobby")return [t+"**참가 대기 ("+s.players.length+"/8명)**\n"+p+"\n\n3명 이상 참가하면 방장이 시작할 수 있습니다.",rows([liarBtn(s,"참가","join",3),liarBtn(s,"나가기","leave"),liarBtn(s,"시작","start",1),close,refresh])];
-  if(s.phase==="talk")return [t+"주제: **"+s.category+"**\n\n"+p+"\n\n각자 [내 제시어]를 눌러 확인한 뒤 음성 채널에서 한 번씩 설명하세요. 설명 시간은 60초입니다."+(s.talkUntil?"\n⏱️ 투표 시작: <t:"+Math.ceil(s.talkUntil/1000)+":R> (<t:"+Math.ceil(s.talkUntil/1000)+":T>)":"") ,rows([liarBtn(s,"내 제시어","role",1),liarBtn(s,"조기 투표","voting",3),close,refresh])];
+  if(s.phase==="talk")return [t+"주제: **"+s.category+"**\n\n"+p+"\n\n각자 [내 제시어]를 눌러 확인한 뒤 음성 채널에서 한 번씩 설명하세요. 설명 시간은 60초입니다."+(s.talkUntil?"\n\n"+liarCountdown(s)+"\n투표 시작 예정: <t:"+Math.ceil(s.talkUntil/1000)+":T>":"") ,rows([liarBtn(s,"내 제시어","role",1),liarBtn(s,"조기 투표","voting",3),close,refresh])];
   if(s.phase==="vote"){
     const buttons=s.players.map((x,j)=>liarBtn(s,(j+1)+". "+x.name.slice(0,55),"vote",1,x.id));
     return [t+"**라이어 투표** · "+Object.keys(s.votes).length+"/"+s.players.length+"명\n"+s.players.map((x,j)=>(j+1)+". "+liarMention(x.id)+(s.votes[x.id]?" ✅":"")).join("\n")+"\n\n자신을 제외한 한 사람을 선택하세요. 득표 결과는 모두 투표한 뒤 공개합니다.",rows(buttons.slice(0,5),buttons.slice(5),[liarBtn(s,"내 제시어","role"),close,refresh])];
@@ -139,13 +149,12 @@ export class LiarTimer extends DurableObject {
   async arm(job){
     if(!job?.token||!Number.isFinite(job.deadline))throw Error("invalid timer");
     await this.ctx.storage.put("job",job);
-    await this.ctx.storage.setAlarm(job.deadline);
+    await this.ctx.storage.setAlarm(liarNextTick(job.deadline));
   }
   async alarm(){
     const job=await this.ctx.storage.get("job");
     if(!job)return;
     const clear=()=>this.ctx.storage.delete("job");
-    if(Date.now()<job.deadline){await this.ctx.storage.setAlarm(job.deadline);return;}
     if(Date.now()>job.deadline+12*60_000){await clear();return;}
     const db=this.env.DB;
     let state=null;
@@ -154,7 +163,7 @@ export class LiarTimer extends DurableObject {
       if(!row){await clear();return;}
       const s=JSON.parse(row.state_json);
       if(s.round!==job.round||s.talkUntil!==job.deadline||s.expires<Date.now()||s.phase==="closed"){await clear();return;}
-      if(s.phase==="talk"){
+      if(s.phase==="talk"&&Date.now()>=job.deadline){
         s.phase="vote";
         const q=await db.prepare("UPDATE card_rooms SET state_json=?,version=version+1,updated_at=? WHERE id=? AND version=? AND game='liar'").bind(JSON.stringify(s),Date.now(),job.id,row.version).run();
         if(q.meta?.changes!==1)continue;
@@ -166,13 +175,21 @@ export class LiarTimer extends DurableObject {
     if(!latest){await clear();return;}
     state=JSON.parse(latest.state_json);
     if(state.round!==job.round||state.phase==="closed"||state.talkUntil!==job.deadline){await clear();return;}
+    // An early vote or a finished round needs no more countdown updates.
+    if(state.phase!=="talk"&&Date.now()<job.deadline){await clear();return;}
+    const ticking=state.phase==="talk";
+    // Schedule the next tick before the network call, including the final deadline.
+    if(ticking)await this.ctx.storage.setAlarm(liarNextTick(job.deadline));
     const [content,buttons]=liarBoard(state);
     const url="https://discord.com/api/v10/webhooks/"+encodeURIComponent(this.env.DISCORD_APPLICATION_ID)+"/"+encodeURIComponent(job.token)+"/messages/@original";
     let response;
     try{response=await fetch(url,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(payloadText(content,buttons))});}
-    catch{throw Error("timer board delivery failed");}
-    if(response.status===429||response.status>=500)throw Error("timer board delivery retry");
+    catch{if(ticking)return;throw Error("timer board delivery failed");}
+    if(response.status===429||response.status>=500){
+      if(ticking)return; // Next scheduled tick retries without a burst of edits.
+      throw Error("timer board delivery retry");
+    }
     if(!response.ok)console.warn("liar_timer_board_status",response.status);
-    await clear();
+    if(!ticking)await clear();
   }
 }
